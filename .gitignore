@@ -1,0 +1,21 @@
+# secrets
+.env
+
+# environment / cache
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+
+# your private reference books (copyright) and everything built from them
+docs/*.pdf
+docs/**/*.pdf
+index/
+index.json
+index.json.bak
+quiz_bank.json
+
+# local helper with machine-specific paths
+run_bot.bat
