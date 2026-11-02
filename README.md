@@ -31,7 +31,7 @@ Flow of one question:
 
 ## Quick start
 
-Requirements: Python 3.10+ (developed on 3.13), [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com/) (for embeddings), and either a free Groq API key or a local Ollama chat model.
+Requirements: Python 3.13+, [uv](https://docs.astral.sh/uv/), [Ollama](https://ollama.com/) (for embeddings), and either a free Groq API key or a local Ollama chat model.
 
 ```bash
 uv sync
