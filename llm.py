@@ -6,6 +6,7 @@ Chosen from .env:
     LLM_BACKEND=ollama       (optional: force the local model)
     LOCAL_MODEL=qwen2.5:3b   (optional: model used when the backend is ollama)
 """
+import json
 import os
 
 from dotenv import load_dotenv
@@ -49,6 +50,39 @@ async def warm_up() -> None:
             options={**OLLAMA_OPTIONS, "num_predict": 1},
             keep_alive=KEEP_ALIVE,
         )
+
+
+async def generate_chat(messages: list[dict], tools: list[dict] | None = None,
+                        max_tokens: int = 2000) -> tuple[str, list[dict]]:
+    """One chat round. Returns (text, tool_calls). tool_calls items are
+    {"id", "name", "args": dict}. On the Ollama backend tools are ignored
+    (empty list back) - the agent then behaves exactly like before.
+    `messages` items should already be in OpenAI chat format (role/content,
+    optional tool_calls / tool_call_id)."""
+    if _api is not None:
+        extra = {}
+        if "gpt-oss" in API_MODEL:
+            # reasoning models spend tokens on "thinking": keep it short
+            extra["extra_body"] = {"reasoning_effort": "low"}
+        kwargs = {"tools": tools} if tools else {}
+        resp = await _api.chat.completions.create(
+            model=API_MODEL,
+            messages=messages,
+            temperature=0,
+            max_tokens=max_tokens,
+            **kwargs,
+        )
+        choice = resp.choices[0]
+        calls = [
+            {"id": tc.id, "name": tc.function.name,
+             "args": json.loads(tc.function.arguments or "{}")}
+            for tc in (choice.message.tool_calls or [])
+        ]
+        return (choice.message.content or "").strip(), calls
+
+    # local Ollama: single user message, no tool support here
+    user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    return await generate(user, max_tokens=max_tokens), []
 
 
 async def generate(prompt: str, max_tokens: int = 2000) -> str:

@@ -1,13 +1,16 @@
-"""Step 5: medical agent = MCP server (search + prompt) + LLM (see llm.py).
+"""Step 5: medical agent = MCP server (search + get_page + calculators) + LLM (see llm.py).
 CLI test:  uv run agent.py
 The MedicalAgent class is reused by the Telegram bot in the next step.
 
 Flow (the code always searches first, the LLM only writes the answer):
   question -> [Arabic? glossary / translate to English] -> MCP tool search_documents
            -> NO_RELEVANT_CONTEXT? -> "I don't know."
-           -> MCP prompt medical_answer(question, context) -> LLM -> answer + sources
+           -> LLM (medical_answer prompt + the user's question) may call MCP tools:
+              get_page (truncated tables) or calc_* (exact formula math, done by code)
+           -> final answer + sources
 """
 import asyncio
+import json
 import re
 import time
 from contextlib import AsyncExitStack
@@ -21,10 +24,68 @@ from ar_terms import arabic_to_query
 NO_ANSWER = "I don't know."
 NO_CONTEXT = "NO_RELEVANT_CONTEXT"
 DISCLAIMER = "This is general information and does not replace consulting a doctor."
-SOURCE_RE = re.compile(r"\[Source: (.+?), page (\d+)")
+SOURCE_RE = re.compile(r"\[Source: (.+?)[,](?: page|, page) (\d+)")
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 LEADING_JUNK_RE = re.compile(r"^[\W_]+")  # bullets, dashes, quotes before the first word
 IDK_PREFIXES = ("i don't know", "i don\u2019t know", "i do not know")
+MAX_TOOL_ROUNDS = 4   # one question can fetch pages / run at most this many tools
+
+# The calculators and get_page are exposed to the LLM as OpenAI-style tools.
+# search_documents is intentionally NOT here: the code always searches first.
+TOOL_SCHEMAS = [
+    {"type": "function", "function": {
+        "name": "get_page",
+        "description": "Fetch the FULL text of one PDF page. Use when a search "
+                       "result's table or list seems cut off.",
+        "parameters": {"type": "object", "properties": {
+            "source": {"type": "string",
+                       "description": "File name after 'Source:' in search results"},
+            "page": {"type": "integer", "description": "Page number, 1-based"}},
+            "required": ["source", "page"]}}},
+    {"type": "function", "function": {
+        "name": "calc_gfr",
+        "description": "eGFR (mL/min/1.73m2), CKD-EPI 2021, from serum creatinine "
+                       "in mg/dL, age and sex - for kidney function questions.",
+        "parameters": {"type": "object", "properties": {
+            "creatinine_mg_dl": {"type": "number"}, "age": {"type": "integer"},
+            "sex": {"enum": ["male", "female"]}},
+            "required": ["creatinine_mg_dl", "age", "sex"]}}},
+    {"type": "function", "function": {
+        "name": "calc_bmi",
+        "description": "BMI from weight (kg) and height (cm) with WHO category; "
+                       "for weight/nutrition classification.",
+        "parameters": {"type": "object", "properties": {
+            "weight_kg": {"type": "number"}, "height_cm": {"type": "number"}},
+            "required": ["weight_kg", "height_cm"]}}},
+    {"type": "function", "function": {
+        "name": "calc_bsa",
+        "description": "Body surface area in m2 (Mosteller) from weight (kg) and "
+                       "height (cm) - for dosing questions.",
+        "parameters": {"type": "object", "properties": {
+            "weight_kg": {"type": "number"}, "height_cm": {"type": "number"}},
+            "required": ["weight_kg", "height_cm"]}}},
+    {"type": "function", "function": {
+        "name": "calc_chadsvat",
+        "description": "CHA2DS2-VASc score + anticoagulation recommendation in "
+                       "atrial fibrillation.",
+        "parameters": {"type": "object", "properties": {
+            "age": {"type": "integer"}, "hypertension": {"type": "boolean"},
+            "diabetes": {"type": "boolean"}, "heart_failure": {"type": "boolean"},
+            "stroke_tia_or_thromboembolism": {"type": "boolean"},
+            "prior_mh_or_atherosclerosis": {"type": "boolean"},
+            "female": {"type": "boolean"}},
+            "required": ["age", "hypertension", "diabetes", "heart_failure",
+                         "stroke_tia_or_thromboembolism", "prior_mh_or_atherosclerosis"]}}},
+    {"type": "function", "function": {
+        "name": "calc_crb65",
+        "description": "CRB-65 score for pneumonia severity from confusion, "
+                       "respiratory rate, blood pressure and age.",
+        "parameters": {"type": "object", "properties": {
+            "confusion": {"type": "boolean"}, "resp_rate_per_min": {"type": "integer"},
+            "sbp_mmhg": {"type": "integer"}, "dbp_mmhg": {"type": "integer"},
+            "age": {"type": "integer"}},
+            "required": ["confusion", "resp_rate_per_min", "sbp_mmhg", "dbp_mmhg", "age"]}}},
+]
 
 
 class MedicalAgent:
@@ -75,11 +136,62 @@ class MedicalAgent:
             if (f, p) not in sources:
                 sources.append((f, p))
 
-        # 2) one LLM call, using the MCP prompt template
+        # 2) LLM with tools. The user message comes from the MCP prompt template
+        #    (question + passages), so the rules stay in one place (medical_server.py).
+        #    The LLM may request full pages (truncated tables) or run a calculator;
+        #    the code computes - the LLM never does the math.
         prompt = await self._session.get_prompt(
-            "medical_answer", {"question": english_q, "context": text}
-        )
-        answer = await llm.generate(prompt.messages[0].content.text)
+            "medical_answer", {"question": english_q, "context": text})
+        messages = [
+            {"role": "system", "content": (
+                "Tools note: tools are available but OPTIONAL - use them ONLY when "
+                "they apply:\n"
+                "- get_page: a passage's table or numbered list appears cut off "
+                "mid-way; fetch the full page (source + page number are given in "
+                "each passage header).\n"
+                "- the calc_* tools: the question contains concrete numbers "
+                "(creatinine, weight/height, BP, age, AF risk factors) and asks to "
+                "compute a value; pass the numbers EXACTLY as the user gave them.\n"
+                "After using a tool, incorporate its result into the final answer. "
+                "Do not call a tool just because one is available.")
+            },
+            {"role": "user", "content": prompt.messages[0].content.text},
+        ]
+        answer = ""
+        for _ in range(MAX_TOOL_ROUNDS):
+            answer, calls = await llm.generate_chat(messages, TOOL_SCHEMAS)
+            if not calls:
+                break
+            messages.append({"role": "assistant", "content": answer or None,
+                             "tool_calls": [
+                                 {"id": c["id"], "type": "function",
+                                  "function": {"name": c["name"],
+                                               "arguments": json.dumps(c["args"])}}
+                                 for c in calls]})
+            for c in calls:
+                if verbose:
+                    print(f"  [tool] {c['name']}({c['args']})")
+                try:
+                    r = await self._session.call_tool(c["name"], c["args"])
+                    out = r.content[0].text if r.content else ""
+                    if r.is_error:
+                        out = f"ERROR: tool failed: {out}"
+                except Exception as e:  # unknown tool, transport hiccup, ...
+                    out = f"ERROR: {type(e).__name__}: {e}"
+                if c["name"] == "get_page":
+                    m = SOURCE_RE.search(out)
+                    if m and (m.group(1), m.group(2)) not in sources:
+                        sources.append((m.group(1), m.group(2)))
+                if verbose:
+                    print(f"         -> {out[:100]}")
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
+        else:
+            # still calling tools after the last round: force a final answer
+            # from whatever context we already have
+            answer, _ = await llm.generate_chat(messages + [
+                {"role": "system", "content": "Answer the question now. Do not call any tools."}
+            ])
+
         if verbose:
             print(f"  [time] {time.perf_counter() - t0:.1f}s")
 

@@ -4,10 +4,13 @@ Test from the terminal:  uv run retriever.py "your question"
 The index is reloaded automatically when ingest.py adds / changes / removes a document,
 so the running bot / MCP server never needs a restart.
 """
+import json
+import os
 import re
 import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import ollama
@@ -71,6 +74,7 @@ class _Index:
 
 _index: _Index | None = None
 _lock = threading.Lock()
+_page_cache: dict[tuple[str, int], str | None] = {}
 
 
 def _build() -> _Index:
@@ -126,6 +130,43 @@ def expand_query(question: str) -> list[str]:
             if full in v:
                 variants.append(v.replace(full, abbr))
     return list(dict.fromkeys(variants))[:6]
+
+
+def _docs_dir() -> Path:
+    return Path(__file__).parent / "docs"
+
+
+def get_page(source: str, page: int) -> str | None:
+    """Return the FULL text of one PDF page (1-based), not a 1200-char search chunk.
+
+    Used when a big table / list on a page got truncated by TEXT_LIMIT in a search
+    chunk. Re-reads the PDF on demand; cached per index stamp, so re-indexing
+    refreshes it automatically. Returns None for out-of-range pages.
+    """
+    idx = _current()
+    stamp = idx.stamp
+    key = (source, page, stamp)
+    if key in _page_cache:
+        return _page_cache[key]
+
+    # guard against arbitrary source strings: only indexed sources are readable
+    if not any(r["source"] == source for r in idx.records):
+        raise FileNotFoundError(f"source '{source}' is not indexed")
+    if not 1 <= page <= 100000:
+        raise ValueError("page must be a positive integer")
+    if len(_page_cache) > 500:  # bound the cache
+        _page_cache.clear()
+
+    from pypdf import PdfReader  # lazy: don't import a PDF lib at module load
+    path = _docs_dir() / source
+    if not path.exists():
+        raise FileNotFoundError(f"file not found: {source}")
+    reader = PdfReader(str(path))
+    if page > len(reader.pages):
+        return None
+    text = reader.pages[page - 1].extract_text() or ""
+    _page_cache[key] = text
+    return text
 
 
 def search(question: str, top_k: int = 5) -> list[dict]:

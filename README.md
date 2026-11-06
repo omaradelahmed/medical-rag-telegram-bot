@@ -11,23 +11,25 @@ Built with the Model Context Protocol (MCP), hybrid retrieval (embeddings + BM25
 - **Grounded answers only:** a relevance threshold plus code-level guards stop the bot from answering out of the model's own memory.
 - **Hybrid retrieval:** `bge-m3` embeddings (via Ollama) + BM25 keywords, fused with reciprocal rank fusion; query expansion maps everyday wording to the books' wording (e.g. "clinical features" to "clinical picture", "chronic kidney disease" to "CKD").
 - **Arabic questions, English answers:** an Arabic medical glossary builds the English search query without relying on the LLM.
-- **MCP server** exposing a search tool, a prompt template and a documents resource.
+- **MCP server** exposing a search tool, a prompt template, a documents resource, and **five clinical calculators** (eGFR CKD-EPI 2021, BMI, BSA, CHA2DS2-VASc, CURB-65) that the model calls as tools instead of doing the arithmetic itself.
 - **Incremental indexing:** add, update or remove PDFs; the running bot sees the change without a restart.
 - **Telegram bot** with a `/quiz` command (random exam questions, no answers).
 - **LLM backend is a setting:** Groq / any OpenAI-compatible API, or local Ollama.
+- **Fast by design:** generation runs on a hosted API (Groq) while the embeddings stay local, which cut end-to-end response time from ~70s on a local 3B model to ~1s.
 
 ## Architecture
 
 ```
 Telegram --> bot.py --> agent.py --> medical_server.py   (MCP server, stdio)
-                          |               '-- retriever.py --> index/  (one .npz per PDF)
+                          |               |-- retriever.py --> index/  (one .npz per PDF)
+                          |               '-- calc.py      (eGFR, BMI, BSA, CHA2DS2-VASc, CURB-65)
                           '--> llm.py   (API or Ollama)
 
 docs/*.pdf --> ingest.py --> index/
 ```
 
 Flow of one question:
-`question` -> (Arabic? glossary to English query) -> MCP tool `search_documents` -> nothing relevant? **"I don't know."** -> MCP prompt `medical_answer` -> LLM -> answer + sources + disclaimer.
+`question` -> (Arabic? glossary to English query) -> MCP tool `search_documents` -> nothing relevant? **"I don't know."** -> MCP prompt `medical_answer` -> LLM -> (optional tool calls: `get_page` or a calculator) -> answer + sources + disclaimer.
 
 ## Quick start
 
@@ -99,11 +101,12 @@ PDFs are never committed to Git (see `.gitignore`); they are usually copyrighted
 | `agent.py` | question -> search -> prompt -> LLM -> answer |
 | `medical_server.py` | MCP server (tool, prompt, resource) |
 | `retriever.py` | hybrid search, query expansion, automatic index reload |
+| `calc.py` | clinical calculators (eGFR CKD-EPI 2021, BMI, BSA, CHA2DS2-VASc, CURB-65) |
 | `store.py`, `ingest.py` | per-document index storage and incremental indexing |
 | `llm.py` | LLM access (API or Ollama) |
 | `ar_terms.py` | Arabic to English medical glossary |
 | `quiz.py`, `build_quiz.py` | `/quiz` command |
-| `check_llm.py`, `debug_search.py`, `test_server.py` | small diagnostic scripts |
+| `check_llm.py`, `debug_search.py`, `test_server.py`, `test_mcp.py`, `test_calc.py` | small diagnostic / test scripts |
 
 ## Limitations
 
